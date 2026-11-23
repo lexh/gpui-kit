@@ -1050,6 +1050,7 @@ pub struct InlineNode {
     pub(crate) text: SharedString,
     pub(crate) image: Option<ImageNode>,
     pub(crate) custom: Option<MarkdownNode>,
+    pub(super) footnote_reference: bool,
     custom_selection: Arc<Mutex<bool>>,
     /// The text styles, each tuple contains the range of the text and the style.
     pub(crate) marks: Vec<(Range<usize>, TextMark)>,
@@ -1064,6 +1065,7 @@ impl PartialEq for InlineNode {
         self.text == other.text
             && self.image == other.image
             && self.custom == other.custom
+            && self.footnote_reference == other.footnote_reference
             && self.marks == other.marks
             && self.source_segments == other.source_segments
     }
@@ -1539,6 +1541,7 @@ impl InlineNode {
             text: text.into(),
             image: None,
             custom: None,
+            footnote_reference: false,
             custom_selection: Arc::default(),
             marks: vec![],
             source_segments: vec![],
@@ -1603,6 +1606,8 @@ impl InlineNode {
 #[derive(Debug, Clone, Default)]
 pub struct Paragraph {
     pub(super) span: Option<Span>,
+    /// The displayed definition prefix, kept in this paragraph's byte space.
+    pub(super) footnote_prefix: Option<usize>,
     pub(super) children: Vec<InlineNode>,
     /// The link references in this paragraph, used for reference links.
     ///
@@ -1750,6 +1755,7 @@ impl RenderStyle {
 impl PartialEq for Paragraph {
     fn eq(&self, other: &Self) -> bool {
         self.span == other.span
+            && self.footnote_prefix == other.footnote_prefix
             && self.children == other.children
             && self.link_refs == other.link_refs
     }
@@ -1759,6 +1765,7 @@ impl Paragraph {
     pub(crate) fn new(text: String) -> Self {
         Self {
             span: None,
+            footnote_prefix: None,
             children: vec![InlineNode::new(&text)],
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
@@ -2426,6 +2433,7 @@ impl Paragraph {
             self,
             Paragraph {
                 span: None,
+                footnote_prefix: None,
                 children: vec![],
                 link_refs: Default::default(),
                 state: Arc::new(Mutex::new(InlineState::default())),
@@ -6419,6 +6427,7 @@ mod tests {
         let combined: String = children.iter().map(|c| c.text.to_string()).collect();
         let paragraph = Paragraph {
             span: None,
+            footnote_prefix: None,
             children,
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),
@@ -7112,6 +7121,7 @@ mod tests {
         };
         Paragraph {
             span: None,
+            footnote_prefix: None,
             children: vec![InlineNode::image(image)],
             link_refs: HashMap::new(),
             state: Arc::new(Mutex::new(InlineState::default())),

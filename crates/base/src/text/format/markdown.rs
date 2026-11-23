@@ -539,7 +539,8 @@ fn merge_children_with_mark(
         text.push_str(&child_text);
 
         for mut node in child_paragraph.children {
-            if node.custom.is_some() {
+            if node.custom.is_some() || node.footnote_reference {
+                // Keep semantic reference boundaries while applying the outer mark.
                 push_merged(
                     paragraph,
                     std::mem::take(&mut merged_text),
@@ -1106,13 +1107,15 @@ fn parse_paragraph(
         },
         Node::FootnoteReference(foot) => {
             let prefix = format!("[{}]", foot.identifier);
-            paragraph.push(mapped_inline(source, prefix.clone(), node, cx).marks(vec![(
+            let mut reference = mapped_inline(source, prefix.clone(), node, cx).marks(vec![(
                 0..prefix.len(),
                 TextMark {
                     italic: true,
                     ..Default::default()
                 },
-            )]));
+            )]);
+            reference.footnote_reference = true;
+            paragraph.push(reference);
         }
         Node::LinkReference(link) => {
             let link_mark = LinkMark {
@@ -1479,13 +1482,31 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
         Node::FootnoteDefinition(def) => {
             let mut paragraph = Paragraph::default();
             let prefix = format!("[{}]: ", def.identifier);
-            paragraph.push(InlineNode::new(&prefix).marks(vec![(
+            let mut label = InlineNode::new(&prefix).marks(vec![(
                 0..prefix.len(),
                 TextMark {
                     italic: true,
                     ..Default::default()
                 },
-            )]));
+            )]);
+            if let Some(span) = span {
+                let end = def
+                    .children
+                    .first()
+                    .and_then(|child| child.position())
+                    .map(|position| cx.offset + position.start.offset)
+                    .filter(|end| *end > span.start && *end <= span.end)
+                    .unwrap_or(span.end);
+                if end > span.start {
+                    label.source_segments.push(SourceSegment {
+                        rendered: 0..prefix.len(),
+                        source: span.start..end,
+                        linear: false,
+                    });
+                }
+            }
+            paragraph.push(label);
+            paragraph.footnote_prefix = Some(prefix.len());
 
             parse_inline_children(source, &mut paragraph, &def.children, cx);
             paragraph.span = new_span(def.position, cx);
@@ -1993,6 +2014,149 @@ mod tests {
         assert_eq!(selected_rendered_range(source, 6..12), Some(6..13));
         assert_eq!(selected_rendered_range(source, 13..18), Some(14..19));
         assert_eq!(selected_rendered_range(source, 4..15), Some(4..16));
+    }
+
+    #[test]
+    fn footnote_metadata_preserves_definition_order_and_ignores_reference_links() {
+        let source = "A[^b] and [normal][b].\n\n[^b]: second\n\nMain resumes.\n\n[^a]: first\n\n[b]: https://example.com";
+        let document = parse(source, &mut NodeContext::default()).unwrap();
+        assert_eq!(document.blocks.len(), 5);
+        let first = first_paragraph(&document.blocks[0]).unwrap();
+        let references: Vec<_> = first
+            .children
+            .iter()
+            .filter(|node| node.footnote_reference)
+            .collect();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].text.as_ref(), "[b]");
+        assert!(first.children.iter().any(|node| !node.footnote_reference
+            && node.marks.iter().any(|(_, mark)| mark.link.is_some())));
+        for (ix, text) in [(1, "[b]: second"), (2, "Main resumes."), (3, "[a]: first")] {
+            let paragraph = first_paragraph(&document.blocks[ix]).unwrap();
+            assert_eq!(paragraph.text(), text);
+            assert_eq!(paragraph.footnote_prefix.is_some(), ix != 2);
+        }
+        let mut changed = first.clone();
+        changed
+            .children
+            .iter_mut()
+            .find(|node| node.footnote_reference)
+            .unwrap()
+            .footnote_reference = false;
+        assert_ne!(
+            *first, changed,
+            "semantic metadata participates in AST equality"
+        );
+        let entry = first_paragraph(&document.blocks[1]).unwrap();
+        let mut changed = entry.clone();
+        changed.footnote_prefix = None;
+        assert_ne!(*entry, changed);
+        assert_eq!(document.source.as_ref(), source);
+    }
+
+    #[test]
+    fn footnote_reference_metadata_survives_enclosing_marks() {
+        for mark in ["*", "**", "~~"] {
+            let source = format!("{mark}before[^a] after{mark}\n\n[^a]: body");
+            let document = parse(&source, &mut NodeContext::default()).unwrap();
+            let paragraph = first_paragraph(&document.blocks[0]).unwrap();
+            let references: Vec<_> = paragraph
+                .children
+                .iter()
+                .filter(|node| node.footnote_reference)
+                .collect();
+            assert_eq!(references.len(), 1, "{mark}");
+            assert_eq!(references[0].text.as_ref(), "[a]");
+            assert_eq!(paragraph.text(), "before[a] after");
+            assert!(references[0].marks.iter().any(|(_, style)| match mark {
+                "*" => style.italic,
+                "**" => style.bold,
+                _ => style.strikethrough,
+            }));
+        }
+    }
+
+    #[test]
+    fn footnote_entry_prefix_mapping_handles_empty_definitions_and_tail_offsets() {
+        for source in ["[^a]: body", "[^a]:\n    body", "[^a]:", "[^a]:   "] {
+            let mut cx = NodeContext {
+                offset: 73,
+                ..Default::default()
+            };
+            let document = parse(source, &mut cx).unwrap();
+            let paragraph = first_paragraph(&document.blocks[0]).unwrap();
+            assert_eq!(paragraph.footnote_prefix, Some(5), "{source:?}");
+            let end = source.find("body").unwrap_or(source.len());
+            assert_eq!(
+                paragraph.children[0].source_segments,
+                [SourceSegment {
+                    rendered: 0..5,
+                    source: 73..73 + end,
+                    linear: false,
+                }]
+            );
+            let mut state = paragraph.state.lock().unwrap();
+            state.set_text(paragraph.text().into());
+            state.selection = Some((0..5).into());
+            drop(state);
+            assert_eq!(document.selected_source_range(), Some(73..73 + end));
+        }
+    }
+
+    #[test]
+    fn footnote_entry_prefix_without_a_positioned_child_uses_the_definition_span() {
+        let source = "[^a]: body";
+        for clear_children in [false, true] {
+            let mut cx = NodeContext {
+                offset: 19,
+                ..Default::default()
+            };
+            let root = to_mdast(source, &cx.markdown_extensions.parse_options())
+                .unwrap()
+                .unwrap();
+            let Node::Root(mut root) = root else {
+                unreachable!()
+            };
+            let Node::FootnoteDefinition(def) = &mut root.children[0] else {
+                panic!("definition")
+            };
+            if clear_children {
+                def.children.clear();
+            } else {
+                let Node::Paragraph(child) = &mut def.children[0] else {
+                    panic!("paragraph")
+                };
+                child.position = None;
+            }
+            let block = ast_to_node(source, root.children.remove(0), &mut cx);
+            let paragraph = first_paragraph(&block).unwrap();
+            assert_eq!(
+                paragraph.children[0].source_segments,
+                [SourceSegment {
+                    rendered: 0..5,
+                    source: 19..19 + source.len(),
+                    linear: false,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn footnote_entry_prefix_maps_atomically_without_changing_display_text() {
+        for source in ["[^a]: body", "[^a]:\n    body"] {
+            let prefix_end = source.find("body").unwrap();
+            assert_eq!(selected_rendered_range(source, 0..5), Some(0..prefix_end));
+            assert_eq!(selected_rendered_range(source, 1..2), Some(0..prefix_end));
+            assert_eq!(
+                selected_rendered_range(source, 5..9),
+                Some(prefix_end..prefix_end + 4)
+            );
+            let document = parse(source, &mut NodeContext::default()).unwrap();
+            assert_eq!(
+                first_paragraph(&document.blocks[0]).unwrap().text(),
+                "[a]: body"
+            );
+        }
     }
 
     #[test]
