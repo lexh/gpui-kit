@@ -36,6 +36,7 @@ use crate::{
 
 use super::{
     SelectionFormat, TextViewStyle,
+    list_layout::ResolvedListLayout,
     utils::{data_url_image, list_item_prefix, ordered_list_ordinal},
 };
 
@@ -89,6 +90,8 @@ pub enum BlockNode {
     },
     ListItem {
         children: Vec<BlockNode>,
+        /// Internally separated blocks, or a direct member of a loose list.
+        /// Used for sibling spacing only when list layout is configured.
         spread: bool,
         /// Whether the list item is checked, if None, it's not a checkbox
         checked: Option<bool>,
@@ -3931,6 +3934,88 @@ impl BlockNode {
 }
 
 impl BlockNode {
+    fn resolve_list_layout(
+        children: &[BlockNode],
+        ordered: bool,
+        start: Option<u32>,
+        depth: usize,
+        node_cx: &NodeContext,
+        window: &mut Window,
+    ) -> Option<ResolvedListLayout> {
+        let layout = node_cx.style.list_layout()?;
+        let gap = layout.marker_gap().to_pixels(window.rem_size());
+        let loose = children
+            .iter()
+            .any(|item| matches!(item, BlockNode::ListItem { spread: true, .. }));
+        let mut width = px(0.);
+        window.with_text_style(Some(node_cx.style.list_style().text.clone()), |window| {
+            let text_style = window.text_style();
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let mut measured_bullet = false;
+            for (ix, item) in children
+                .iter()
+                .filter(|item| item.is_list_item())
+                .enumerate()
+            {
+                if matches!(
+                    item,
+                    BlockNode::ListItem {
+                        checked: Some(_),
+                        ..
+                    }
+                ) {
+                    width = width.max(rems(0.9375).to_pixels(window.rem_size()));
+                } else if ordered || !measured_bullet {
+                    let marker = list_item_prefix(ix, start, ordered, depth)
+                        .trim_end()
+                        .to_string();
+                    let runs = [text_style.to_run(marker.len())];
+                    width = width.max(
+                        window
+                            .text_system()
+                            .shape_line(marker.into(), font_size, &runs, None)
+                            .width,
+                    );
+                    measured_bullet = true;
+                }
+            }
+        });
+        let lane = layout
+            .indent()
+            .to_pixels(window.rem_size())
+            .max(width + gap);
+        let scale = window.scale_factor();
+        Some(ResolvedListLayout {
+            lane: px((f32::from(lane) * scale).ceil() / scale),
+            marker_gap: gap,
+            item_gap: if loose {
+                layout.loose_item_gap()
+            } else {
+                layout.item_gap()
+            }
+            .to_pixels(window.rem_size()),
+            nested_gap: layout.item_gap().to_pixels(window.rem_size()),
+            paragraph_gap: layout.paragraph_gap().to_pixels(window.rem_size()),
+        })
+    }
+
+    fn task_checkbox(
+        checkbox: Div,
+        task_toggle: Option<(Arc<TaskToggleHandlerFn>, TaskToggleEvent)>,
+    ) -> AnyElement {
+        match task_toggle {
+            Some((handler, event)) => checkbox
+                .id(("task-toggle", event.item_range().start))
+                .on_click(move |_, window, cx| {
+                    crate::TextSelection::end(window, cx);
+                    cx.stop_propagation();
+                    handler(&event, window, cx);
+                })
+                .into_any_element(),
+            None => checkbox.into_any_element(),
+        }
+    }
+
     /// `task_toggle` is the view's task toggle handler with the event a click
     /// on the item's checkbox reports, when the checkbox should be clickable.
     #[allow(clippy::too_many_arguments)]
@@ -3943,6 +4028,7 @@ impl BlockNode {
         style: &TextViewStyle,
         line_height: Pixels,
         indent: Pixels,
+        layout: Option<ResolvedListLayout>,
     ) -> Div {
         h_flex()
             .w_full()
@@ -3950,30 +4036,41 @@ impl BlockNode {
             .relative()
             .items_start()
             .content_start()
-            .when(!options.todo && checked.is_none(), |this| {
-                // The marker hangs in an indent column, right-aligned against
-                // the text like an outside list marker, and steps back in
-                // color so the item text leads.
-                this.child(
-                    div()
-                        .flex_none()
-                        .min_w(indent)
-                        .pr(indent * 0.3)
-                        .text_right()
-                        .text_color(style.muted_foreground())
-                        .refine_style(style.list_style())
-                        .child(
-                            list_item_prefix(
-                                ix,
-                                options.list_start,
-                                options.ordered,
-                                options.depth,
-                            )
-                            .trim_end()
-                            .to_string(),
-                        ),
-                )
-            })
+            .when(
+                checked.is_none() && (!options.todo || layout.is_some()),
+                |this| {
+                    // The marker hangs in an indent column, right-aligned against
+                    // the text like an outside list marker, and steps back in
+                    // color so the item text leads.
+                    this.child(
+                        div()
+                            .flex_none()
+                            .min_w(indent)
+                            .pr(indent * 0.3)
+                            .text_right()
+                            .text_color(style.muted_foreground())
+                            .refine_style(style.list_style())
+                            .when_some(layout, |this, layout| {
+                                this.w(layout.lane)
+                                    .min_w(layout.lane)
+                                    .max_w(layout.lane)
+                                    .pl(px(0.))
+                                    .pr(layout.marker_gap)
+                                    .whitespace_nowrap()
+                            })
+                            .child(
+                                list_item_prefix(
+                                    ix,
+                                    options.list_start,
+                                    options.ordered,
+                                    options.depth,
+                                )
+                                .trim_end()
+                                .to_string(),
+                            ),
+                    )
+                },
+            )
             .when_some(checked, |this, checked| {
                 // Todo list checkbox
                 let check_svg = if style.is_dark() {
@@ -3989,6 +4086,12 @@ impl BlockNode {
                         .flex_none()
                         .items_center()
                         .justify_center()
+                        .when_some(layout, |this, layout| {
+                            this.w(layout.lane)
+                                .mr(px(0.))
+                                .pr(layout.marker_gap)
+                                .justify_end()
+                        })
                         .child(
                             div()
                                 .flex()
@@ -4012,18 +4115,16 @@ impl BlockNode {
                                         )))
                                         .size(rems(0.75)),
                                     )
+                                })
+                                .map(|checkbox| {
+                                    Self::task_checkbox(
+                                        checkbox,
+                                        task_toggle.clone().filter(|_| layout.is_some()),
+                                    )
                                 }),
                         )
-                        .map(|checkbox| match task_toggle {
-                            Some((handler, event)) => checkbox
-                                .id(("task-toggle", event.item_range().start))
-                                .on_click(move |_, window, cx| {
-                                    crate::TextSelection::end(window, cx);
-                                    cx.stop_propagation();
-                                    handler(&event, window, cx);
-                                })
-                                .into_any_element(),
-                            None => checkbox.into_any_element(),
+                        .map(|checkbox| {
+                            Self::task_checkbox(checkbox, task_toggle.filter(|_| layout.is_none()))
                         }),
                 )
             })
@@ -4046,6 +4147,7 @@ impl BlockNode {
         item: &BlockNode,
         ix: usize,
         options: NodeRenderOptions,
+        layout: Option<ResolvedListLayout>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -4053,13 +4155,13 @@ impl BlockNode {
         match item {
             BlockNode::ListItem {
                 children,
-                spread,
                 checked,
                 task_marker,
                 span,
+                ..
             } => {
                 let body = body_font_size(node_cx, window);
-                let indent = body * 1.4;
+                let indent = layout.map_or(body * 1.4, |layout| layout.lane);
                 let task_toggle = match (&node_cx.task_toggle_handler, checked, span, task_marker) {
                     (Some(handler), Some(checked), Some(item), Some(marker)) => Some((
                         handler.clone(),
@@ -4075,8 +4177,9 @@ impl BlockNode {
                     .w_full()
                     .min_w_0()
                     // Items breathe a little apart, less than paragraphs do.
-                    .when(ix > 0, |this| this.pt(body * 0.25))
-                    .when(*spread, |this| this.child(div()))
+                    .when(ix > 0, |this| {
+                        this.pt(layout.map_or(body * 0.25, |layout| layout.item_gap))
+                    })
                     .children({
                         let mut items: Vec<Div> = Vec::with_capacity(children.len());
 
@@ -4105,7 +4208,7 @@ impl BlockNode {
                                     // Continuation paragraph — stack vertically below
                                     // the previous row, indented to align with the text
                                     // column (past bullet/number prefix).
-                                    if last_not_list {
+                                    if last_not_list && layout.is_none() {
                                         if let Some(preceding_row) = items.pop() {
                                             items.push(
                                                 div().child(preceding_row).child(
@@ -4129,6 +4232,9 @@ impl BlockNode {
                                                 .w_full()
                                                 .min_w_0()
                                                 .pl(indent)
+                                                .when_some(layout, |this, layout| {
+                                                    this.pt(layout.paragraph_gap)
+                                                })
                                                 .overflow_hidden()
                                                 .child(text),
                                         );
@@ -4144,20 +4250,30 @@ impl BlockNode {
                                         &node_cx.style,
                                         window.line_height(),
                                         indent,
+                                        layout,
                                     ));
                                 }
                                 BlockNode::List { .. } => {
-                                    items.push(div().ml(indent).child(child.render_block(
-                                        NodeRenderOptions {
-                                            depth: options.depth + 1,
-                                            todo: checked.is_some(),
-                                            is_last: true,
-                                            ..options
-                                        },
-                                        node_cx,
-                                        window,
-                                        cx,
-                                    )));
+                                    items.push(
+                                        div()
+                                            .ml(indent)
+                                            .when(child_ix > 0, |this| {
+                                                this.when_some(layout, |this, layout| {
+                                                    this.pt(layout.nested_gap)
+                                                })
+                                            })
+                                            .child(child.render_block(
+                                                NodeRenderOptions {
+                                                    depth: options.depth + 1,
+                                                    todo: checked.is_some(),
+                                                    is_last: true,
+                                                    ..options
+                                                },
+                                                node_cx,
+                                                window,
+                                                cx,
+                                            )),
+                                    );
                                 }
                                 BlockNode::Root { .. }
                                 | BlockNode::Heading { .. }
@@ -4189,6 +4305,7 @@ impl BlockNode {
                                             &node_cx.style,
                                             window.line_height(),
                                             indent,
+                                            layout,
                                         ));
                                     } else {
                                         // Indent continuation blocks to align with a
@@ -4199,6 +4316,9 @@ impl BlockNode {
                                                 .w_full()
                                                 .min_w_0()
                                                 .pl(indent)
+                                                .when_some(layout, |this, layout| {
+                                                    this.pt(layout.paragraph_gap)
+                                                })
                                                 .overflow_hidden()
                                                 .child(block),
                                         );
@@ -4734,37 +4854,48 @@ impl BlockNode {
                 ordered,
                 start,
                 ..
-            } => div()
-                .w_full()
-                .min_w_0()
-                .pb(mb)
-                .children({
-                    let mut items = Vec::with_capacity(children.len());
-                    let mut item_index = 0;
-                    for (ix, item) in children.into_iter().enumerate() {
-                        let is_item = item.is_list_item();
+            } => {
+                let layout = Self::resolve_list_layout(
+                    children,
+                    *ordered,
+                    *start,
+                    options.depth,
+                    node_cx,
+                    window,
+                );
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .pb(mb)
+                    .children({
+                        let mut items = Vec::with_capacity(children.len());
+                        let mut item_index = 0;
+                        for (ix, item) in children.into_iter().enumerate() {
+                            let is_item = item.is_list_item();
 
-                        items.push(Self::render_list_item(
-                            item,
-                            item_index,
-                            NodeRenderOptions {
-                                ix,
-                                ordered: *ordered,
-                                list_start: *start,
-                                ..options
-                            },
-                            node_cx,
-                            window,
-                            cx,
-                        ));
+                            items.push(Self::render_list_item(
+                                item,
+                                item_index,
+                                NodeRenderOptions {
+                                    ix,
+                                    ordered: *ordered,
+                                    list_start: *start,
+                                    ..options
+                                },
+                                layout,
+                                node_cx,
+                                window,
+                                cx,
+                            ));
 
-                        if is_item {
-                            item_index += 1;
+                            if is_item {
+                                item_index += 1;
+                            }
                         }
-                    }
-                    items
-                })
-                .into_any_element(),
+                        items
+                    })
+                    .into_any_element()
+            }
             BlockNode::CodeBlock(code_block) => code_block.render(&options, node_cx, window, cx),
             BlockNode::Custom { node, state } => {
                 let inner = match node_cx.markdown_extensions.render_block(node, window, cx) {

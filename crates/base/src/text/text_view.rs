@@ -3002,6 +3002,7 @@ mod tests {
 
     struct TaskListTestRoot {
         text_view: Entity<TextViewState>,
+        layout: bool,
         toggles: Option<TaskToggles>,
         container_clicks: Arc<AtomicUsize>,
     }
@@ -3009,6 +3010,11 @@ mod tests {
     impl Render for TaskListTestRoot {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let container_clicks = self.container_clicks.clone();
+            let style = if self.layout {
+                TextViewStyle::default().with_list_layout(crate::ListLayout::new())
+            } else {
+                TextViewStyle::default()
+            };
             div()
                 .id("task-list-container")
                 .w(px(300.))
@@ -3017,7 +3023,7 @@ mod tests {
                     container_clicks.fetch_add(1, Ordering::Relaxed);
                 })
                 .child(crate::TextSelectionLayer)
-                .child(TextView::new(&self.text_view).when_some(
+                .child(TextView::new(&self.text_view).style(style).when_some(
                     self.toggles.clone(),
                     |this, toggles| {
                         this.on_task_toggle(move |event, _, _| {
@@ -3030,13 +3036,18 @@ mod tests {
 
     /// Clicks the checkbox of each item of [`TASK_LIST`], then the text of
     /// its first item, and returns how many clicks reached the container.
-    fn click_task_list(toggles: Option<TaskToggles>, cx: &mut TestAppContext) -> usize {
+    fn click_task_list(
+        toggles: Option<TaskToggles>,
+        layout: bool,
+        cx: &mut TestAppContext,
+    ) -> usize {
         cx.update(crate::init);
         let container_clicks = Arc::new(AtomicUsize::new(0));
         let (root, cx) = cx.add_window_view({
             let container_clicks = container_clicks.clone();
             move |_, cx| TaskListTestRoot {
                 text_view: cx.new(|cx| TextViewState::markdown(TASK_LIST, cx)),
+                layout,
                 toggles,
                 container_clicks,
             }
@@ -3059,58 +3070,66 @@ mod tests {
         }
         let open = text("Open", cx);
         cx.simulate_click(open, Modifiers::default());
+        if layout {
+            // The empty marker gap must not share the checkbox's handler.
+            cx.simulate_click(open - point(px(1.), px(0.)), Modifiers::default());
+        }
         container_clicks.load(Ordering::Relaxed)
     }
 
     #[gpui::test]
     fn task_checkbox_click_reports_its_new_state_item_and_marker(cx: &mut TestAppContext) {
-        let toggles = TaskToggles::default();
-        let container_clicks = click_task_list(Some(toggles.clone()), cx);
+        for layout in [false, true] {
+            let toggles = TaskToggles::default();
+            let container_clicks = click_task_list(Some(toggles.clone()), layout, cx);
 
-        let reported: Vec<_> = toggles
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|event| (event.checked(), event.item_range(), event.marker_range()))
-            .collect();
-        let task = |checked, item: &str, marker: &str| {
-            let item_start = TASK_LIST.find(item).unwrap();
-            let marker_start = item_start + item.find(marker).unwrap();
-            (
-                checked,
-                item_start..item_start + item.len(),
-                marker_start..marker_start + marker.len(),
-            )
-        };
-        assert_eq!(
-            reported,
-            vec![
-                task(true, "- [ ] Open\n  - [x] Nested", "[ ]"),
-                task(false, "- [x] Nested", "[x]"),
-                task(false, "* [X] Star", "[X]"),
-                task(true, "+ [ ] Plus", "[ ]"),
-                task(false, "1. [x] One", "[x]"),
-                task(true, "2) [ ] Two", "[ ]"),
-            ],
-            "each checkbox reports the flipped state, its item with any nested \
+            let reported: Vec<_> = toggles
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| (event.checked(), event.item_range(), event.marker_range()))
+                .collect();
+            let task = |checked, item: &str, marker: &str| {
+                let item_start = TASK_LIST.find(item).unwrap();
+                let marker_start = item_start + item.find(marker).unwrap();
+                (
+                    checked,
+                    item_start..item_start + item.len(),
+                    marker_start..marker_start + marker.len(),
+                )
+            };
+            assert_eq!(
+                reported,
+                vec![
+                    task(true, "- [ ] Open\n  - [x] Nested", "[ ]"),
+                    task(false, "- [x] Nested", "[x]"),
+                    task(false, "* [X] Star", "[X]"),
+                    task(true, "+ [ ] Plus", "[ ]"),
+                    task(false, "1. [x] One", "[x]"),
+                    task(true, "2) [ ] Two", "[ ]"),
+                ],
+                "each checkbox reports the flipped state, its item with any nested \
              list and exactly its `[ ]` / `[x]`, and a click on the item text \
              toggles nothing",
-        );
-        assert_eq!(
-            container_clicks, 1,
-            "only the click on the text reaches the container"
-        );
+            );
+            assert_eq!(
+                container_clicks,
+                if layout { 2 } else { 1 },
+                "text and the opt-in empty lane reach the container, but checkboxes do not"
+            );
+        }
     }
 
     #[gpui::test]
     fn task_checkboxes_without_a_handler_are_not_interactive(cx: &mut TestAppContext) {
-        let container_clicks = click_task_list(None, cx);
-
-        assert_eq!(
-            container_clicks,
-            TASK_LABELS.len() + 1,
-            "every click, including those on a checkbox, reaches the container"
-        );
+        for layout in [false, true] {
+            let container_clicks = click_task_list(None, layout, cx);
+            assert_eq!(
+                container_clicks,
+                TASK_LABELS.len() + if layout { 2 } else { 1 },
+                "every click, including those on a checkbox, reaches the container"
+            );
+        }
     }
 
     #[test]

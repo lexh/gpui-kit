@@ -10,6 +10,9 @@ mod inline_flow;
 mod inline_object;
 #[cfg(test)]
 mod inline_virtual_tests;
+mod list_layout;
+#[cfg(test)]
+mod list_layout_tests;
 mod markdown_ext;
 mod node;
 mod range_highlight;
@@ -24,6 +27,7 @@ mod utils;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
 pub use inline_element::*;
+pub use list_layout::ListLayout;
 pub use markdown_ext::*;
 pub use node::{CodeBlock, TableData};
 pub use range_highlight::{RangeHighlight, RangeHighlightError, RenderedText};

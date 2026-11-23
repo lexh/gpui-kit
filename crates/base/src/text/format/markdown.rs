@@ -1349,10 +1349,17 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
             }
         }
         Node::List(list) => {
+            let loose = list.spread;
             let children = list
                 .children
                 .into_iter()
-                .map(|c| ast_to_node(source, c, cx))
+                .map(|c| {
+                    let mut node = ast_to_node(source, c, cx);
+                    if let BlockNode::ListItem { spread, .. } = &mut node {
+                        *spread |= loose;
+                    }
+                    node
+                })
                 .collect();
             BlockNode::List {
                 ordered: list.ordered,
@@ -1503,6 +1510,32 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
 mod tests {
     use super::*;
     use gpui::ParentElement;
+
+    #[test]
+    fn loose_list_metadata_reaches_only_its_direct_items() {
+        let source = "- First\n\n- Last\n  - Child\n  - Other";
+        let document = parse(source, &mut NodeContext::default()).expect("parse");
+        let [BlockNode::List { children, .. }] = document.blocks.as_slice() else {
+            panic!("one source list must remain one block");
+        };
+        assert!(
+            children
+                .iter()
+                .all(|item| matches!(item, BlockNode::ListItem { spread: true, .. }))
+        );
+        let BlockNode::ListItem { children, .. } = &children[1] else {
+            unreachable!()
+        };
+        let BlockNode::List { children, .. } = &children[1] else {
+            panic!("nested list")
+        };
+        assert!(
+            children
+                .iter()
+                .all(|item| matches!(item, BlockNode::ListItem { spread: false, .. }))
+        );
+        assert_eq!(document.source.as_ref(), source);
+    }
 
     #[test]
     fn parser_panic_falls_back_to_plain_text() {

@@ -4,6 +4,8 @@ use gpui::{HighlightStyle, Hsla, Rems, StyleRefinement, rems};
 
 use crate::ColorTokens;
 
+use super::ListLayout;
+
 /// TextViewStyle used to customize the style for [`super::TextView`].
 ///
 /// The fields are private because this type crosses the `gpui-base` seam:
@@ -29,6 +31,7 @@ pub struct TextViewStyle {
     inline_code_style: StyleRefinement,
     /// Explicit list marker refinements, applied after theme and surface colors.
     list_style: StyleRefinement,
+    list_layout: Option<ListLayout>,
     /// Explicit blockquote refinements, applied after theme and surface colors.
     blockquote_style: StyleRefinement,
     /// The table body background, or the theme surface when `None`. Only
@@ -60,6 +63,7 @@ impl PartialEq for TextViewStyle {
             && self.inline_code == other.inline_code
             && self.inline_code_style == other.inline_code_style
             && self.list_style == other.list_style
+            && self.list_layout == other.list_layout
             && self.blockquote_style == other.blockquote_style
             && self.table_background == other.table_background
             && self.table_row_hover == other.table_row_hover
@@ -108,6 +112,7 @@ impl TextViewStyle {
             },
             inline_code_style: StyleRefinement::default(),
             list_style: StyleRefinement::default(),
+            list_layout: None,
             blockquote_style: StyleRefinement::default(),
             table_background: None,
             table_row_hover: None,
@@ -213,10 +218,26 @@ impl TextViewStyle {
     /// family, size, and weight style the bullet or number. The text color
     /// also outlines an unchecked task-list checkbox; a checked one keeps the
     /// link color. Unspecified properties keep the existing defaults, and
-    /// explicit refinements also take precedence on inverted surfaces.
+    /// explicit refinements also take precedence on inverted surfaces. When
+    /// `list_layout` is configured, it owns lane width and marker gap after
+    /// these refinements; marker measurement uses the refined text style.
     pub fn with_list_style(mut self, style: StyleRefinement) -> Self {
         self.list_style = style;
         self
+    }
+
+    /// Configures shared marker lanes and tight/loose list spacing.
+    ///
+    /// Absent by default, preserving legacy list geometry. This does not
+    /// install a task handler or change checked state.
+    pub fn with_list_layout(mut self, layout: ListLayout) -> Self {
+        self.list_layout = Some(layout);
+        self
+    }
+
+    /// Opt-in list geometry, or `None` for legacy layout.
+    pub fn list_layout(&self) -> Option<&ListLayout> {
+        self.list_layout.as_ref()
     }
 
     /// Refines the blockquote container.
