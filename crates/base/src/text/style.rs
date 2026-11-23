@@ -38,6 +38,7 @@ pub struct TextViewStyle {
     /// The background of a hovered table body row, or no hover highlight
     /// when `None`.
     table_row_hover: Option<Hsla>,
+    numeric_table_alignment: bool,
     is_dark: bool,
 }
 
@@ -62,6 +63,7 @@ impl PartialEq for TextViewStyle {
             && self.blockquote_style == other.blockquote_style
             && self.table_background == other.table_background
             && self.table_row_hover == other.table_row_hover
+            && self.numeric_table_alignment == other.numeric_table_alignment
             && self.is_dark == other.is_dark
     }
 }
@@ -109,6 +111,7 @@ impl TextViewStyle {
             blockquote_style: StyleRefinement::default(),
             table_background: None,
             table_row_hover: None,
+            numeric_table_alignment: false,
             is_dark,
         }
     }
@@ -266,6 +269,26 @@ impl TextViewStyle {
     pub fn with_table_row_hover(mut self, color: Hsla) -> Self {
         self.table_row_hover = Some(color);
         self
+    }
+
+    /// Right-aligns unmarked table columns whose nonempty body cells are numeric.
+    ///
+    /// Disabled by default. Explicit left, center and right source alignments
+    /// always win. Headers do not participate; missing and empty body cells
+    /// are ignored, and at least one numeric body cell is required. Numeric
+    /// text starts with an optional `~` and sign, then a digit followed by
+    /// digits or `.,/:%`, optionally ending in up to three ASCII unit letters
+    /// separated by spaces or tabs. Images, inline objects and multiline cells
+    /// are not numeric. This affects presentation only, including HTML tables;
+    /// source alignments, selection and copied text are unchanged.
+    pub fn with_numeric_table_alignment(mut self, enabled: bool) -> Self {
+        self.numeric_table_alignment = enabled;
+        self
+    }
+
+    /// Whether unmarked numeric table columns infer right alignment.
+    pub fn has_numeric_table_alignment(&self) -> bool {
+        self.numeric_table_alignment
     }
 
     /// Sets whether content-specific assets should use their dark variant.

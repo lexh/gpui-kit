@@ -4454,6 +4454,9 @@ impl BlockNode {
                 .refine_style(&slack_style)
         };
 
+        let alignments = style
+            .has_numeric_table_alignment()
+            .then(|| table.effective_column_alignments(style));
         let row_count = table.children.len();
         let [top_left, top_right, bottom_left, bottom_right] =
             Self::table_row_corner_radii(style, window);
@@ -4463,7 +4466,10 @@ impl BlockNode {
             let mut cells = Vec::with_capacity(col_count * 2);
             for (ix, column) in columns.iter().enumerate() {
                 let is_last_col = ix + 1 == col_count;
-                let align = table.column_align(ix);
+                let align = alignments
+                    .as_ref()
+                    .and_then(|alignments| alignments.get(ix).copied())
+                    .unwrap_or_else(|| table.column_align(ix));
                 let content = row.children.get(ix).map(|cell| {
                     let fade_key = table
                         .span

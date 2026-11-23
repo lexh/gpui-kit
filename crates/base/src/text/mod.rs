@@ -18,6 +18,7 @@ mod selection_adapter;
 mod state;
 mod stream_fade;
 mod style;
+mod table_alignment;
 mod text_view;
 mod utils;
 

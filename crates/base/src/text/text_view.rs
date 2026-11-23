@@ -2187,14 +2187,50 @@ mod tests {
         assert_eq!(copied.trim(), "Cell A");
     }
 
-    /// Text in a right-aligned or centered column is selected where it is
-    /// painted: a drag over it selects it, and the highlight covers it.
     #[gpui::test]
     fn table_drag_selects_aligned_cell_text_where_it_is_painted(cx: &mut TestAppContext) {
+        aligned_table_selection(
+            "| Quarterly revenue | Review status |\n| ---: | :---: |\n| 42 | ok |",
+            false,
+            true,
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn inferred_numeric_table_alignment_keeps_native_selection(cx: &mut TestAppContext) {
+        aligned_table_selection(
+            "| Quarterly revenue | Review status |\n| --- | :---: |\n| 42 | ok |",
+            true,
+            true,
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn numeric_table_inference_preserves_explicit_left_alignment(cx: &mut TestAppContext) {
+        aligned_table_selection(
+            "| Quarterly revenue | Review status |\n| :--- | :---: |\n| 42 | ok |",
+            true,
+            false,
+            cx,
+        );
+    }
+
+    /// Text in an explicitly or automatically aligned column is selected
+    /// where it is painted, including after a style-only reflow.
+    fn aligned_table_selection(
+        source: &str,
+        infer: bool,
+        right_aligned: bool,
+        cx: &mut TestAppContext,
+    ) {
         const SELECTION: u32 = 0xf020b0;
+        const SEARCH: u32 = 0x20b0f0;
 
         struct AlignedTableRoot {
             text_view: Entity<TextViewState>,
+            infer: bool,
         }
 
         impl Render for AlignedTableRoot {
@@ -2205,23 +2241,39 @@ mod tests {
                     .w(px(520.))
                     .underline()
                     .child(crate::TextSelectionLayer)
-                    .child(TextView::new(&self.text_view).style(
-                        TextViewStyle::default().with_selection(gpui::rgb(SELECTION).into()),
-                    ))
+                    .child(
+                        TextView::new(&self.text_view).style(
+                            TextViewStyle::default()
+                                .with_selection(gpui::rgb(SELECTION).into())
+                                .with_numeric_table_alignment(self.infer),
+                        ),
+                    )
             }
         }
 
         cx.update(crate::init);
         let (root, cx) = cx.add_window_view(|_, cx| AlignedTableRoot {
-            text_view: cx.new(|cx| {
-                TextViewState::markdown(
-                    "| Quarterly revenue | Review status |\n| ---: | :---: |\n| 42 | ok |",
-                    cx,
-                )
-            }),
+            text_view: cx.new(|cx| TextViewState::markdown(source, cx)),
+            infer,
         });
         let cx: &mut VisualTestContext = cx;
         cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let state = root.read_with(cx, |root, _| root.text_view.clone());
+        state.update(cx, |state, cx| {
+            let text = state.rendered_text();
+            let start = text.as_str().find("42").expect("search match");
+            state
+                .set_range_highlights(
+                    [crate::text::RangeHighlight::new(
+                        start..start + 2,
+                        gpui::rgb(SEARCH),
+                    )],
+                    cx,
+                )
+                .expect("valid search range");
+        });
         cx.update(|window, cx| window.draw(cx).clear(cx));
 
         let mut underlines = cx.update(|window, _| {
@@ -2242,8 +2294,13 @@ mod tests {
         };
         // The body text is narrower than its header, so it is drawn at the
         // end or in the middle of its column.
-        assert!((right.right() - right_head.right()).abs() < px(1.));
-        assert!(right.left() > right_head.left() + px(1.));
+        if right_aligned {
+            assert!((right.right() - right_head.right()).abs() < px(1.));
+            assert!(right.left() > right_head.left() + px(1.));
+        } else {
+            assert!((right.left() - right_head.left()).abs() < px(1.));
+            assert!(right.right() < right_head.right() - px(1.));
+        }
         assert!((center.center().x - center_head.center().x).abs() < px(1.));
         assert!(center.left() > center_head.left() + px(1.));
 
@@ -2282,6 +2339,39 @@ mod tests {
                 }),
                 "the highlight {highlights:?} must cover the text above {underline:?}"
             );
+            let range = root.read_with(cx, |root, cx| {
+                root.text_view
+                    .read(cx)
+                    .selected_source_range()
+                    .expect("source range")
+            });
+            assert_eq!(&source[range], expected);
+        }
+
+        if infer {
+            let rendered = root.read_with(cx, |root, cx| {
+                root.text_view.read(cx).rendered_text().as_str().to_string()
+            });
+            root.update(cx, |root, cx| {
+                root.infer = false;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            root.read_with(cx, |root, cx| {
+                let state = root.text_view.read(cx);
+                assert_eq!(state.selected_text().trim(), "ok");
+                assert_eq!(state.rendered_text().as_str(), rendered);
+                assert_eq!(state.rendered_text().source(), source);
+            });
+            cx.update(|window, _| {
+                let search: gpui::Background = gpui::rgb(SEARCH).into();
+                assert!(
+                    window
+                        .painted_quads()
+                        .iter()
+                        .any(|quad| quad.background == search)
+                );
+            });
         }
     }
 
@@ -3806,9 +3896,7 @@ mod tests {
                 let quad = window
                     .painted_quads()
                     .into_iter()
-                    .find(|quad| {
-                        quad.background == head && quad.corner_radii != Default::default()
-                    })
+                    .find(|quad| quad.background == head && quad.corner_radii != Default::default())
                     .unwrap_or_else(|| panic!("{mode}: the header background quad is painted"));
                 (quad, window.scale_factor())
             });
