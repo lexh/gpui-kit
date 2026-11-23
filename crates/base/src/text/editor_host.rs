@@ -34,7 +34,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::{
     TextViewDefaults, TextViewStyle,
-    document::{NodeRenderOptions, PrevBlock, flow_position},
+    document::{NodeRenderOptions, PrevBlock, flow_position, next_is_footnote},
     editor_seam::{self, EditorSink},
     format::markdown,
     markdown_ext::MarkdownExtensions,
@@ -188,6 +188,7 @@ pub struct FlowPosition {
     is_first: bool,
     is_last: bool,
     prev: PrevBlock,
+    next_is_footnote: bool,
 }
 
 impl FlowPosition {
@@ -200,6 +201,7 @@ impl FlowPosition {
             is_first,
             is_last,
             prev,
+            next_is_footnote: next_is_footnote(blocks, ix),
         }
     }
 
@@ -251,6 +253,7 @@ impl BlockNode {
                 is_first: flow.is_first,
                 is_last: flow.is_last,
                 prev: flow.prev,
+                next_is_footnote: flow.next_is_footnote,
                 ..Default::default()
             },
             &cx.node,

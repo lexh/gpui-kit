@@ -634,6 +634,10 @@ impl TextViewState {
                 if append && self.full_update_revision <= self.committed_revision {
                     self.splice_appended_blocks(&content.document);
                 }
+                let footnote_lanes_changed = append
+                    && self.text_view_style.footnote_style().is_some()
+                    && self.parsed_content.document.footnote_prefixes()
+                        != content.document.footnote_prefixes();
                 self.reconcile_range_highlights(&content.document, parsed_update.revision, append);
                 self.stream_fade.record(
                     &self.parsed_content.document,
@@ -649,7 +653,7 @@ impl TextViewState {
                 self.parsed_content = content;
                 self.parsed_error = None;
                 self.compatible_layout_update = parsed_update.selection_compatible;
-                if parsed_update.full_parse {
+                if parsed_update.full_parse || footnote_lanes_changed {
                     self.invalidate_measured_heights();
                 }
             }
@@ -1211,6 +1215,7 @@ impl Render for TextViewState {
             offset: self.parsed_content.node_cx.offset,
             link_refs: self.parsed_content.node_cx.link_refs.clone(),
             style: self.text_view_style.clone(),
+            footnote_prefixes: None,
             code_block_actions: self.code_block_actions.clone(),
             code_block_highlighter: self.code_block_highlighter.clone(),
             table_actions: self.table_actions.clone(),
@@ -1466,6 +1471,7 @@ fn parse_content(
     }?;
 
     if options.append {
+        content.document.footnote_prefixes = Default::default();
         content.document.source =
             format!("{}{}", content.document.source, options.pending_text).into();
         Arc::make_mut(&mut content.document.blocks)

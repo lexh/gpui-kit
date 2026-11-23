@@ -21,7 +21,7 @@ use crate::{
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, Link, LinkClickHandlerFn, LinkFn,
         MarkdownExtensions, MarkdownNode, TableActionsFn, TaskToggleEvent, TaskToggleHandlerFn,
-        document::{NodeRenderOptions, PrevBlock, flow_position},
+        document::{NodeRenderOptions, PrevBlock, flow_position, next_is_footnote},
         inline::{
             Inline, InlineHighlight, InlineState, code_insets, combine_highlights, fade_highlights,
             foreground_highlights, point_in_text_selection, text_runs, text_size_ranges,
@@ -1535,6 +1535,17 @@ fn list_selected_source(
 }
 
 impl InlineNode {
+    fn highlight(&self, mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHighlight {
+        let mut highlight = mark_highlight(mark, node_cx, cx);
+        if self.footnote_reference
+            && let Some(style) = node_cx.style.footnote_style()
+        {
+            highlight.font_size_scale = Some(style.reference_scale());
+            highlight.baseline_raise = Some(style.reference_raise());
+        }
+        highlight
+    }
+
     /// A run of text with no marks.
     pub fn new(text: impl Into<SharedString>) -> Self {
         Self {
@@ -1816,7 +1827,7 @@ impl Paragraph {
             let mut node_highlights = vec![];
             for (range, style) in &inline_node.marks {
                 let inner_range = (offset + range.start)..(offset + range.end);
-                let mut highlight = mark_highlight(style, node_cx, cx);
+                let mut highlight = inline_node.highlight(style, node_cx, cx);
                 if let Some(link_mark) = style.link.clone() {
                     let link = node_cx.link(&link_mark, cx);
                     if link.is_some() {
@@ -2209,6 +2220,8 @@ struct TableColumnWidths {
     rem_size: Pixels,
     mono_family: SharedString,
     inline_code: HighlightStyle,
+    /// Reference typography can change independently of inherited row styles.
+    reference_scale: Option<f32>,
     /// Maxima from ordinary text only. Custom cells may shrink after an update.
     widths: Vec<f32>,
     custom_cells: Vec<(usize, usize)>,
@@ -2845,6 +2858,7 @@ pub(crate) struct NodeContext {
     pub(crate) offset: usize,
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
     pub(crate) style: Arc<TextViewStyle>,
+    pub(crate) footnote_prefixes: Option<Arc<Vec<SharedString>>>,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     pub(crate) code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     pub(crate) table_actions: Option<Arc<TableActionsFn>>,
@@ -3021,6 +3035,7 @@ fn mark_highlight(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHig
         style: highlight,
         font_family,
         font_size_scale: mark.code.then_some(0.875),
+        baseline_raise: None,
         code_style: mark.code.then(|| node_cx.style.inline_code_style().clone()),
     }
 }
@@ -3060,7 +3075,7 @@ impl Paragraph {
                 .map(|(range, mark)| {
                     (
                         (offset + range.start)..(offset + range.end),
-                        mark_highlight(mark, node_cx, cx),
+                        inline_node.highlight(mark, node_cx, cx),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -3077,21 +3092,33 @@ impl Paragraph {
         &self,
         fade_key: Option<TextLeafKey>,
         node_cx: &NodeContext,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let children = &self.children;
         let fades = node_cx.stream_fades(fade_key);
         let backgrounds = node_cx.range_backgrounds(fade_key);
 
-        if self.should_render_inline_flow() {
-            return InlineFlow::new(
+        let footnotes = node_cx.style.footnote_style();
+        if self.should_render_inline_flow()
+            || (footnotes.is_some()
+                && (self.footnote_prefix.is_some()
+                    || children.iter().any(|node| node.footnote_reference)))
+        {
+            let mut flow = InlineFlow::new(
                 self.element_id(fade_key),
                 self.inline_flow_items(fade_key, fades, backgrounds, node_cx, cx),
                 node_cx.link_click_handler.clone(),
             )
-            .editor_key(self.leaf_key())
-            .into_any_element();
+            .editor_key(self.leaf_key());
+            if let Some((prefix, style)) = self.footnote_prefix.zip(footnotes) {
+                flow = flow.hanging_prefix(
+                    prefix,
+                    style.indent().to_pixels(window.rem_size()),
+                    node_cx.footnote_prefixes.clone(),
+                );
+            }
+            return flow.into_any_element();
         }
 
         let has_image = children.iter().any(|child| child.image.is_some());
@@ -3182,7 +3209,7 @@ impl Paragraph {
                 let mut node_highlights = vec![];
                 for (range, style) in &inline_node.marks {
                     let inner_range = (offset + range.start)..(offset + range.end);
-                    let mut highlight = mark_highlight(style, node_cx, cx);
+                    let mut highlight = inline_node.highlight(style, node_cx, cx);
 
                     if let Some(link_mark) = style.link.as_ref()
                         && let Some(link) = node_cx.link(link_mark, cx)
@@ -3453,7 +3480,7 @@ impl Paragraph {
             let mut node_highlights = vec![];
             for (range, style) in &inline_node.marks {
                 let inner_range = (offset + range.start)..(offset + range.end);
-                let mut highlight = mark_highlight(style, node_cx, cx);
+                let mut highlight = inline_node.highlight(style, node_cx, cx);
                 if let Some(link_mark) = &style.link {
                     let link = node_cx.link(link_mark, cx);
                     if let Some(link) = &link {
@@ -3628,6 +3655,10 @@ fn measure_table_columns(
     let rem_size = window.rem_size();
     let mono_family = cx.theme().tokens.typography.mono;
     let inline_code = node_cx.style.inline_code_highlight();
+    let reference_scale = node_cx
+        .style
+        .footnote_style()
+        .map(|style| style.reference_scale());
     let cached = table.column_widths_cache.0.lock().ok().and_then(|cache| {
         cache
             .as_ref()
@@ -3637,6 +3668,7 @@ fn measure_table_columns(
                     && cached.rem_size == rem_size
                     && cached.mono_family == mono_family
                     && cached.inline_code == inline_code
+                    && cached.reference_scale == reference_scale
                     && cached.text_system == text_system_id(window)
             })
             .cloned()
@@ -3650,6 +3682,7 @@ fn measure_table_columns(
             rem_size,
             mono_family,
             inline_code,
+            reference_scale,
             widths,
             custom_cells,
         });
@@ -4711,6 +4744,8 @@ impl BlockNode {
                             is_first,
                             prev,
                             is_last: options.is_last && ix + 1 == children.len(),
+                            next_is_footnote: node_cx.style.footnote_style().is_some()
+                                && next_is_footnote(children, ix),
                             ..options
                         },
                         node_cx,
@@ -4719,15 +4754,35 @@ impl BlockNode {
                     )
                 }))
                 .into_any_element(),
-            BlockNode::Paragraph(paragraph) => gapped(
-                paragraph.render(
-                    paragraph.span.map(|span| TextLeafKey::block(span.start)),
-                    node_cx,
-                    window,
-                    cx,
-                ),
-                mb,
-            ),
+            BlockNode::Paragraph(paragraph) => {
+                let key = paragraph.span.map(|span| TextLeafKey::block(span.start));
+                if let Some(style) = node_cx
+                    .style
+                    .footnote_style()
+                    .filter(|_| paragraph.footnote_prefix.is_some())
+                {
+                    let font_size = window.text_style().font_size.to_pixels(window.rem_size())
+                        * style.entry_scale();
+                    let content = window.with_text_style(
+                        Some(TextStyleRefinement {
+                            font_size: Some(font_size.into()),
+                            ..Default::default()
+                        }),
+                        |window| paragraph.render(key, node_cx, window, cx),
+                    );
+                    let gap = if options.next_is_footnote && !options.is_last && !options.in_list {
+                        style.entry_gap().unwrap_or(mb)
+                    } else {
+                        mb
+                    };
+                    gapped(
+                        div().text_size(font_size).child(content).into_any_element(),
+                        gap,
+                    )
+                } else {
+                    gapped(paragraph.render(key, node_cx, window, cx), mb)
+                }
+            }
             BlockNode::Heading {
                 level,
                 children,
@@ -4800,6 +4855,11 @@ impl BlockNode {
                                         NodeRenderOptions {
                                             is_first,
                                             prev,
+                                            next_is_footnote: node_cx
+                                                .style
+                                                .footnote_style()
+                                                .is_some()
+                                                && next_is_footnote(children, index),
                                             ..options.is_last(is_last)
                                         },
                                         node_cx,
@@ -4845,6 +4905,8 @@ impl BlockNode {
                                 NodeRenderOptions {
                                     is_first,
                                     prev,
+                                    next_is_footnote: node_cx.style.footnote_style().is_some()
+                                        && next_is_footnote(children, ix),
                                     ..options
                                         .is_last(children[ix + 1..].iter().all(Self::draws_nothing))
                                 },
@@ -5289,6 +5351,7 @@ mod tests {
         let document = crate::text::document::ParsedDocument {
             source: source.into(),
             blocks: Arc::new(vec![block.clone()]),
+            ..Default::default()
         };
         assert!(!block.has_selection());
         state.set_selection(Some(BlockSelection::Full));
@@ -7172,6 +7235,7 @@ mod tests {
 
         let document = ParsedDocument {
             source: source.into(),
+            footnote_prefixes: Default::default(),
             blocks: vec![
                 BlockNode::Paragraph(selected_paragraph("start")),
                 BlockNode::List {
@@ -7218,6 +7282,7 @@ mod tests {
 
         let document = ParsedDocument {
             source: source.into(),
+            footnote_prefixes: Default::default(),
             blocks: vec![
                 BlockNode::Paragraph(selected_paragraph("before")),
                 BlockNode::Paragraph(image),
@@ -7239,6 +7304,7 @@ mod tests {
         // it, is not enclosed and is dropped.
         let document = ParsedDocument {
             source: String::new().into(),
+            footnote_prefixes: Default::default(),
             blocks: vec![
                 BlockNode::Paragraph(selected_paragraph("before")),
                 BlockNode::Paragraph(image_paragraph("alt", "u")),
@@ -7309,6 +7375,7 @@ mod tests {
         // copied Markdown re-renders with the same structure.
         let document = ParsedDocument {
             source: String::new().into(),
+            footnote_prefixes: Default::default(),
             blocks: vec![
                 BlockNode::Heading {
                     level: 1,

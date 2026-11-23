@@ -115,6 +115,7 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
     Ok(ParsedDocument {
         source: source.to_string().into(),
         blocks: Arc::new(vec![node]),
+        ..Default::default()
     })
 }
 
@@ -1174,7 +1175,8 @@ mod tests {
                         ..Default::default()
                     })],
                     ..Default::default()
-                })])
+                })]),
+                ..Default::default()
             }
         );
 
@@ -1195,7 +1197,8 @@ mod tests {
                         ..Default::default()
                     })],
                     ..Default::default()
-                })])
+                })]),
+                ..Default::default()
             }
         );
     }

@@ -4,7 +4,7 @@ use gpui::{
 
 use std::{
     ops::{Range, RangeInclusive},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::text::{
@@ -13,10 +13,17 @@ use crate::text::{
 };
 
 /// The parsed document AST.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ParsedDocument {
     pub(crate) source: SharedString,
     pub(crate) blocks: Arc<Vec<BlockNode>>,
+    pub(crate) footnote_prefixes: OnceLock<Arc<Vec<SharedString>>>,
+}
+
+impl PartialEq for ParsedDocument {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.blocks == other.blocks
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -28,6 +35,7 @@ pub(crate) struct NodeRenderOptions {
     pub(crate) list_start: Option<u32>,
     pub(crate) depth: usize,
     pub(crate) is_last: bool,
+    pub(crate) next_is_footnote: bool,
     /// Whether this block opens its flow -- the document or a blockquote --
     /// and so takes no gap above it. An HTML block container passes it on to
     /// its own first child.
@@ -70,6 +78,12 @@ pub(crate) fn flow_position<B: std::borrow::Borrow<BlockNode>>(
     }
 }
 
+pub(crate) fn next_is_footnote<B: std::borrow::Borrow<BlockNode>>(blocks: &[B], ix: usize) -> bool {
+    blocks[ix + 1..].iter().map(B::borrow)
+        .find(|block| !matches!(block, BlockNode::Definition { .. } | BlockNode::Break { .. } | BlockNode::Unknown))
+        .is_some_and(|block| matches!(block, BlockNode::Paragraph(paragraph) if paragraph.footnote_prefix.is_some()))
+}
+
 impl NodeRenderOptions {
     pub(crate) fn is_last(mut self, is_last: bool) -> Self {
         self.is_last = is_last;
@@ -78,6 +92,12 @@ impl NodeRenderOptions {
 }
 
 impl ParsedDocument {
+    pub(super) fn footnote_prefixes(&self) -> Arc<Vec<SharedString>> {
+        self.footnote_prefixes
+            .get_or_init(|| Arc::new(super::footnote_style::prefixes(&self.blocks)))
+            .clone()
+    }
+
     pub(super) fn text(&self) -> String {
         let mut text = String::new();
         for block in self.blocks.iter() {
@@ -244,6 +264,13 @@ impl ParsedDocument {
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
+        let node_cx = if node_cx.style.footnote_style().is_some() {
+            let mut styled = node_cx.clone();
+            styled.footnote_prefixes = Some(self.footnote_prefixes());
+            std::borrow::Cow::Owned(styled)
+        } else {
+            std::borrow::Cow::Borrowed(node_cx)
+        };
         let Some(list_state) = list_state else {
             let blocks_len = self.blocks.len();
             return div().children(self.blocks.iter().enumerate().map(move |(ix, node)| {
@@ -255,9 +282,11 @@ impl ParsedDocument {
                         is_last,
                         is_first,
                         prev,
+                        next_is_footnote: node_cx.style.footnote_style().is_some()
+                            && next_is_footnote(&self.blocks, ix),
                         ..Default::default()
                     },
-                    node_cx,
+                    &node_cx,
                     window,
                     cx,
                 )
@@ -276,7 +305,7 @@ impl ParsedDocument {
 
         div().size_full().child(
             gpui::list(list_state, {
-                let node_cx = node_cx.clone();
+                let node_cx = node_cx.into_owned();
                 let blocks = blocks.clone();
                 move |ix, window, cx| {
                     let is_last = ix + 1 == blocks.len();
@@ -288,6 +317,8 @@ impl ParsedDocument {
                                 is_last,
                                 is_first,
                                 prev,
+                                next_is_footnote: node_cx.style.footnote_style().is_some()
+                                    && next_is_footnote(&blocks, ix),
                                 ..options
                             },
                             &node_cx,

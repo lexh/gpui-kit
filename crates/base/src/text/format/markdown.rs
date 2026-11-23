@@ -1188,6 +1188,7 @@ fn ast_to_document(source: &str, root: mdast::Node, cx: &mut NodeContext) -> Par
     ParsedDocument {
         source: source.to_string().into(),
         blocks: Arc::new(blocks),
+        ..Default::default()
     }
 }
 

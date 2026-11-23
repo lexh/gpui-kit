@@ -583,3 +583,39 @@ blocks inside it. Child blocks keep their own explicit styles, including
 heading and table font sizes. Other element properties apply to the container
 as they do to any `div`. Code blocks, tables, rules, and done tasks keep the
 shared muted and border colors.
+
+## Footnote typography
+
+Base's `TextViewStyle::with_footnote_style` opts into native reference scaling,
+baseline raising, and hanging definition lanes. Without it, the existing
+footnote appearance is unchanged.
+
+```rust
+use gpui_kit::rems;
+use gpui_kit::base::{FootnoteStyle, TextView, TextViewStyle};
+
+TextView::markdown("notes", "Text[^a].\n\n[^a]: A note.")
+    .style(TextViewStyle::default().with_footnote_style(
+        FootnoteStyle::new()
+            .with_reference_scale(0.75)
+            .with_reference_raise(0.25)
+            .with_entry_scale(0.85)
+            .with_indent(rems(2.))
+            .with_entry_gap(rems(0.4)),
+    ))
+```
+
+Reference and entry scales inherit their container's font size. The raise is in
+inherited ems; indent and gap are window rems. The lane fits the document's
+longest label or the configured minimum, whichever is wider. At a width too
+narrow for that lane, the entry falls back to normal wrapping. Entry gaps only
+replace spacing before another definition; prose and section gaps are kept.
+Lists retain their own spacing.
+
+`FootnoteStyle::new()` keeps both scales at 1 and the raise at 0, fits the lane
+to its labels, and inherits the paragraph gap. Setters ignore non-finite values
+and nonpositive scales; negative lengths and raises clamp to zero.
+
+Identifiers, definition order, source bytes, native selection/copy, and range
+highlights are preserved. This does not renumber or relocate definitions, add
+backlinks, or change ordinary reference links.

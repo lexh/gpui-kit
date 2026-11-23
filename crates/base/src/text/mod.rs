@@ -3,6 +3,9 @@ mod block_surface_tests;
 mod document;
 pub mod editor_host;
 mod editor_seam;
+mod footnote_style;
+#[cfg(test)]
+mod footnote_view_tests;
 mod format;
 mod inline;
 mod inline_element;
@@ -25,6 +28,7 @@ mod table_alignment;
 mod text_view;
 mod utils;
 
+pub use footnote_style::FootnoteStyle;
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
 pub use inline_element::*;
 pub use list_layout::ListLayout;

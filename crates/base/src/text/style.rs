@@ -4,7 +4,7 @@ use gpui::{HighlightStyle, Hsla, Rems, StyleRefinement, rems};
 
 use crate::ColorTokens;
 
-use super::ListLayout;
+use super::{FootnoteStyle, ListLayout};
 
 /// TextViewStyle used to customize the style for [`super::TextView`].
 ///
@@ -32,6 +32,7 @@ pub struct TextViewStyle {
     /// Explicit list marker refinements, applied after theme and surface colors.
     list_style: StyleRefinement,
     list_layout: Option<ListLayout>,
+    footnote_style: Option<FootnoteStyle>,
     /// Explicit blockquote refinements, applied after theme and surface colors.
     blockquote_style: StyleRefinement,
     /// The table body background, or the theme surface when `None`. Only
@@ -64,6 +65,7 @@ impl PartialEq for TextViewStyle {
             && self.inline_code_style == other.inline_code_style
             && self.list_style == other.list_style
             && self.list_layout == other.list_layout
+            && self.footnote_style == other.footnote_style
             && self.blockquote_style == other.blockquote_style
             && self.table_background == other.table_background
             && self.table_row_hover == other.table_row_hover
@@ -113,6 +115,7 @@ impl TextViewStyle {
             inline_code_style: StyleRefinement::default(),
             list_style: StyleRefinement::default(),
             list_layout: None,
+            footnote_style: None,
             blockquote_style: StyleRefinement::default(),
             table_background: None,
             table_row_hover: None,
@@ -238,6 +241,20 @@ impl TextViewStyle {
     /// Opt-in list geometry, or `None` for legacy layout.
     pub fn list_layout(&self) -> Option<&ListLayout> {
         self.list_layout.as_ref()
+    }
+
+    /// Configures native footnote typography and hanging entry lanes.
+    ///
+    /// Absent by default, preserving the existing appearance. Definitions
+    /// remain in source order, with unchanged identifiers and copied text.
+    pub fn with_footnote_style(mut self, style: FootnoteStyle) -> Self {
+        self.footnote_style = Some(style);
+        self
+    }
+
+    /// Opt-in footnote presentation, or `None` for the existing appearance.
+    pub fn footnote_style(&self) -> Option<&FootnoteStyle> {
+        self.footnote_style.as_ref()
     }
 
     /// Refines the blockquote container.

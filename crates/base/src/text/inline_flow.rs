@@ -24,6 +24,10 @@ use super::{
     range_highlight::RevealAt,
 };
 
+#[cfg(test)]
+#[path = "footnote_flow_tests.rs"]
+mod footnote_tests;
+
 const IMAGE_LEN: usize = 1;
 pub(super) const INLINE_CODE_PADDING: f32 = 4.;
 
@@ -34,6 +38,7 @@ pub(super) struct InlineFlow {
     /// The block editor leaf this flow renders (design D3): its fragments
     /// and atoms are reported to the editor sink as pieces.
     editor_key: Option<u64>,
+    hanging: Option<FlowHanging>,
 }
 
 /// Bytes an image or custom inline node occupies in an editor leaf (one
@@ -155,8 +160,36 @@ impl InlineFlowFrameState {
     }
 }
 
+/// Unresolved label geometry, compared without shaping on layout-cache hits.
+#[derive(Clone)]
+struct FlowHanging {
+    prefix_len: usize,
+    min_indent: Pixels,
+    labels: Option<Arc<Vec<SharedString>>>,
+}
+
+impl PartialEq for FlowHanging {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix_len == other.prefix_len
+            && self.min_indent == other.min_indent
+            && match (&self.labels, &other.labels) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedHanging {
+    prefix_len: usize,
+    lane: Pixels,
+    prefix_width: Pixels,
+}
+
 /// Everything but the wrap width that a flow's layout depends on.
 struct FlowLayoutKey {
+    hanging: Option<FlowHanging>,
     items: Vec<MeasureItem>,
     image_sizes: Vec<Option<Size<Pixels>>>,
     typography: InlineFlowTypography,
@@ -172,6 +205,7 @@ impl FlowLayoutKey {
                 .all(|(item, other)| item.same_layout_input(other))
             && self.image_sizes == other.image_sizes
             && self.typography == other.typography
+            && self.hanging == other.hanging
     }
 }
 
@@ -279,6 +313,7 @@ struct LineFragmentLayout {
     size: Size<Pixels>,
     source_range: Range<usize>,
     baseline: Pixels,
+    raise: Pixels,
 }
 
 enum LineFragmentKind {
@@ -328,7 +363,22 @@ impl InlineFlow {
             items,
             link_click_handler,
             editor_key: None,
+            hanging: None,
         }
+    }
+
+    pub(super) fn hanging_prefix(
+        mut self,
+        prefix_len: usize,
+        min_indent: Pixels,
+        labels: Option<Arc<Vec<SharedString>>>,
+    ) -> Self {
+        self.hanging = Some(FlowHanging {
+            prefix_len,
+            min_indent,
+            labels,
+        });
+        self
     }
 
     pub(super) fn editor_key(mut self, key: Option<u64>) -> Self {
@@ -415,6 +465,7 @@ impl Element for InlineFlow {
             .collect::<Vec<_>>();
         let objects = prepare_objects(&measure_items, &typography.text_style, window, cx);
         frame_state.borrow_mut().set_key(FlowLayoutKey {
+            hanging: self.hanging.clone(),
             items: measure_items,
             image_sizes,
             typography: typography.clone(),
@@ -454,6 +505,7 @@ impl Element for InlineFlow {
                                 &objects,
                                 &typography.text_style,
                                 wrap_width,
+                                key.hanging.as_ref(),
                                 window,
                                 cx,
                             )
@@ -1001,6 +1053,7 @@ fn layout_flow(
         &objects,
         text_style,
         wrap_width,
+        None,
         window,
         cx,
     )
@@ -1024,12 +1077,52 @@ fn count_line_work(units: usize) {
     let _ = units;
 }
 
+fn resolve_hanging(
+    input: &FlowHanging,
+    flow: &FlowItems,
+    text_style: &TextStyle,
+    window: &mut Window,
+) -> Option<ResolvedHanging> {
+    let MeasureItem::Text {
+        text, highlights, ..
+    } = flow.items.first()?
+    else {
+        return None;
+    };
+    let prefix = text.get(..input.prefix_len)?;
+    if prefix.is_empty() || prefix.contains('\n') {
+        return None;
+    }
+    let highlights = slice_ranges(highlights, 0, prefix.len(), |range, highlight| {
+        (range, highlight.clone())
+    });
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let runs = text_runs(prefix.len(), text_style, &highlights);
+    let prefix_width = shape_line(prefix.to_string().into(), font_size, &runs, window).width();
+    let mut lane = input.min_indent.max(prefix_width);
+    if let Some(labels) = &input.labels {
+        let mut label_style = text_style.clone();
+        label_style.font_style = gpui::FontStyle::Italic;
+        for label in labels.iter() {
+            let runs = text_runs(label.len(), &label_style, &[]);
+            lane = lane.max(shape_line(label.clone(), font_size, &runs, window).width());
+        }
+    }
+    Some(ResolvedHanging {
+        prefix_len: input.prefix_len,
+        lane,
+        prefix_width,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn layout_measured_flow(
     items: &[MeasureItem],
     image_sizes: &[Option<Size<Pixels>>],
     prepared_objects: &[Option<MeasuredInlineObject>],
     text_style: &TextStyle,
     wrap_width: Option<Pixels>,
+    hanging: Option<&FlowHanging>,
     window: &mut Window,
     _cx: &mut App,
 ) -> InlineFlowLayout {
@@ -1043,9 +1136,13 @@ fn layout_measured_flow(
         return InlineFlowLayout::default();
     }
 
+    let hanging = hanging
+        .and_then(|input| resolve_hanging(input, &flow, text_style, window))
+        .filter(|hanging| wrap_width.is_none_or(|width| width > hanging.lane));
+    let body_width = wrap_width.map(|width| width - hanging.map_or(Pixels::ZERO, |h| h.lane));
     let objects = prepared_objects
         .iter()
-        .map(|object| object.clone().map(|object| object.fit_text(wrap_width)))
+        .map(|object| object.clone().map(|object| object.fit_text(body_width)))
         .collect::<Vec<_>>();
     // An image wider than the wrap is narrowed to it, in its ratio, the way
     // the image-alone path narrows with `max_w(relative(1.))`; text objects
@@ -1055,7 +1152,7 @@ fn layout_measured_flow(
         .iter()
         .map(|image_size| {
             image_size.map(|mut size| {
-                if let Some(wrap_width) = wrap_width
+                if let Some(wrap_width) = body_width
                     && size.width > wrap_width
                 {
                     size.height *= wrap_width / size.width;
@@ -1070,7 +1167,8 @@ fn layout_measured_flow(
         &image_sizes,
         &objects,
         text_style,
-        wrap_width,
+        body_width,
+        hanging.map_or(0, |h| h.prefix_len),
         window,
     );
     let mut fragments = Vec::new();
@@ -1092,7 +1190,17 @@ fn layout_measured_flow(
     let body_overflow_above = (body_line.ascent - body_baseline).max(Pixels::ZERO);
     let body_overflow_below = (body_line.descent - (line_height - body_baseline)).max(Pixels::ZERO);
 
-    for line_range in line_ranges {
+    for (line_ix, mut line_range) in line_ranges.into_iter().enumerate() {
+        let line_x = hanging.map_or(Pixels::ZERO, |h| {
+            if line_ix == 0 {
+                h.lane - h.prefix_width
+            } else {
+                h.lane
+            }
+        });
+        if hanging.is_some() && line_ix == 0 {
+            line_range.start = 0;
+        }
         let mut line_fragments = Vec::new();
         let mut line_width = Pixels::ZERO;
         let mut line_ascent = body_baseline;
@@ -1111,75 +1219,97 @@ fn layout_measured_flow(
                         if start >= end {
                             continue;
                         }
-                        let subtext = SharedString::from(text[start..end].to_string());
-                        let mut highlights = slice_ranges(
-                            ranges.highlights.overlapping(start..end),
-                            start,
-                            end,
-                            |range, style| (range, style.clone()),
-                        );
-                        let links = slice_ranges(
-                            ranges.links.overlapping(start..end),
-                            start,
-                            end,
-                            |range, link| (range, link.clone()),
-                        );
-                        let runs = text_runs(subtext.len(), text_style, &highlights);
-                        let segment_font_size = font_size * *scale;
-                        let shaped_line =
-                            shape_line(subtext.clone(), segment_font_size, &runs, window);
-                        let is_code = highlights.iter().any(|(_, h)| h.font_size_scale.is_some());
-                        let insets = code_insets(&highlights, segment_font_size, window.rem_size());
-                        let width = shaped_line.width() + insets.left + insets.right;
-                        // Measure the run by its glyph box. The body strut already
-                        // carries the line's leading, so a run only has to fit its
-                        // glyphs: leading of its own would make a smaller or
-                        // differently proportioned run, such as inline code, push
-                        // its line taller than a plain one. Positioning grows the
-                        // box back to the line. The compact code background is
-                        // painted independently.
-                        let glyph_size = size(
-                            width,
-                            shaped_line.ascent + shaped_line.descent + insets.top + insets.bottom,
-                        );
-                        let baseline = shaped_line.ascent + insets.top;
-                        let code_background = is_code
-                            .then(|| {
-                                code_background(
-                                    &shaped_line,
-                                    &runs,
-                                    segment_font_size,
-                                    &mut highlights,
-                                    glyph_size,
-                                    baseline,
-                                    window,
-                                )
-                            })
-                            .flatten();
-                        line_ascent = line_ascent.max(baseline - body_overflow_above);
-                        line_descent =
-                            line_descent.max(glyph_size.height - baseline - body_overflow_below);
-                        let trailing = subtext.len() - subtext.trim_end_matches(' ').len();
-                        line_width += if trailing > 0 && item_start + end == line_range.end {
-                            shaped_line.x_for_index(subtext.len() - trailing)
-                                + insets.left
-                                + insets.right
-                        } else {
-                            width
-                        };
-                        line_fragments.push(LineFragmentLayout {
-                            item_ix,
-                            kind: LineFragmentKind::Text {
-                                font_size: segment_font_size,
-                                text: subtext,
-                                links,
-                                highlights,
-                                code_background,
-                            },
-                            size: glyph_size,
-                            source_range: start..end,
-                            baseline: baseline,
+                        // The reserved prefix is an atomic first-line fragment,
+                        // even when its size/marks match the following body.
+                        let prefix_end = hanging
+                            .filter(|_| item_ix == 0)
+                            .map(|h| h.prefix_len)
+                            .filter(|cut| start < *cut && *cut < end);
+                        let parts = prefix_end.map_or([Some(start..end), None], |cut| {
+                            [Some(start..cut), Some(cut..end)]
                         });
+                        for part in parts.into_iter().flatten() {
+                            let (start, end) = (part.start, part.end);
+                            let subtext = SharedString::from(text[start..end].to_string());
+                            let mut highlights = slice_ranges(
+                                ranges.highlights.overlapping(start..end),
+                                start,
+                                end,
+                                |range, style| (range, style.clone()),
+                            );
+                            let links = slice_ranges(
+                                ranges.links.overlapping(start..end),
+                                start,
+                                end,
+                                |range, link| (range, link.clone()),
+                            );
+                            let runs = text_runs(subtext.len(), text_style, &highlights);
+                            let segment_font_size = font_size * *scale;
+                            let shaped_line =
+                                shape_line(subtext.clone(), segment_font_size, &runs, window);
+                            let is_code = highlights.iter().any(|(_, h)| h.code_style.is_some());
+                            let raise = font_size
+                                * highlights
+                                    .iter()
+                                    .find_map(|(_, h)| h.baseline_raise)
+                                    .unwrap_or(0.);
+                            let insets =
+                                code_insets(&highlights, segment_font_size, window.rem_size());
+                            let width = shaped_line.width() + insets.left + insets.right;
+                            // Measure the run by its glyph box. The body strut already
+                            // carries the line's leading, so a run only has to fit its
+                            // glyphs: leading of its own would make a smaller or
+                            // differently proportioned run, such as inline code, push
+                            // its line taller than a plain one. Positioning grows the
+                            // box back to the line. The compact code background is
+                            // painted independently.
+                            let glyph_size = size(
+                                width,
+                                shaped_line.ascent
+                                    + shaped_line.descent
+                                    + insets.top
+                                    + insets.bottom,
+                            );
+                            let baseline = shaped_line.ascent + insets.top;
+                            let code_background = is_code
+                                .then(|| {
+                                    code_background(
+                                        &shaped_line,
+                                        &runs,
+                                        segment_font_size,
+                                        &mut highlights,
+                                        glyph_size,
+                                        baseline,
+                                        window,
+                                    )
+                                })
+                                .flatten();
+                            line_ascent = line_ascent.max(baseline + raise - body_overflow_above);
+                            line_descent = line_descent
+                                .max(glyph_size.height - baseline - raise - body_overflow_below);
+                            let trailing = subtext.len() - subtext.trim_end_matches(' ').len();
+                            line_width += if trailing > 0 && item_start + end == line_range.end {
+                                shaped_line.x_for_index(subtext.len() - trailing)
+                                    + insets.left
+                                    + insets.right
+                            } else {
+                                width
+                            };
+                            line_fragments.push(LineFragmentLayout {
+                                item_ix,
+                                kind: LineFragmentKind::Text {
+                                    font_size: segment_font_size,
+                                    text: subtext,
+                                    links,
+                                    highlights,
+                                    code_background,
+                                },
+                                size: glyph_size,
+                                source_range: start..end,
+                                baseline,
+                                raise,
+                            });
+                        }
                     }
                 }
                 MeasureItem::Object { .. } => {
@@ -1194,6 +1324,7 @@ fn layout_measured_flow(
                         size: metrics.size,
                         source_range: 0..IMAGE_LEN,
                         baseline: metrics.baseline,
+                        raise: Pixels::ZERO,
                     });
                 }
                 MeasureItem::Image { .. } => {
@@ -1211,7 +1342,8 @@ fn layout_measured_flow(
                             kind: LineFragmentKind::Image,
                             size,
                             source_range: 0..IMAGE_LEN,
-                            baseline: baseline,
+                            baseline,
+                            raise: Pixels::ZERO,
                         });
                     }
                 }
@@ -1222,12 +1354,12 @@ fn layout_measured_flow(
             empty_lines.push((
                 line_range.start,
                 Bounds::new(
-                    point(Pixels::ZERO, y),
+                    point(line_x, y),
                     size(Pixels::ZERO, line_ascent + line_descent),
                 ),
             ));
         }
-        let mut x = Pixels::ZERO;
+        let mut x = line_x;
         for mut fragment in line_fragments {
             // Give a text run's glyph box equal leading on both sides, as
             // much as the line allows: its glyphs are painted centered in the
@@ -1235,14 +1367,14 @@ fn layout_measured_flow(
             // gets exactly the line box. The leading is negative where the
             // glyphs overflow the line, as a plain text line's do.
             let leading = match fragment.kind {
-                LineFragmentKind::Text { .. } => (line_ascent - fragment.baseline)
-                    .min(line_descent - (fragment.size.height - fragment.baseline))
+                LineFragmentKind::Text { .. } => (line_ascent - fragment.baseline - fragment.raise)
+                    .min(line_descent - (fragment.size.height - fragment.baseline) + fragment.raise)
                     .max(-fragment.size.height / 2.),
                 _ => Pixels::ZERO,
             };
             fragment.size.height += leading * 2.;
             fragment.baseline += leading;
-            let origin = point(x, y + line_ascent - fragment.baseline);
+            let origin = point(x, y + line_ascent - fragment.baseline - fragment.raise);
             let selection_bounds = Bounds::new(
                 point(x, y),
                 size(fragment.size.width, line_ascent + line_descent),
@@ -1283,7 +1415,7 @@ fn layout_measured_flow(
             fragments.push(positioned);
         }
 
-        max_width = max_width.max(line_width);
+        max_width = max_width.max(line_x + line_width);
         y += line_ascent + line_descent;
     }
 
@@ -1518,15 +1650,19 @@ fn line_ranges(
     objects: &[Option<MeasuredInlineObject>],
     text_style: &TextStyle,
     wrap_width: Option<Pixels>,
+    body_start: usize,
     window: &mut Window,
 ) -> Vec<Range<usize>> {
     let mut hard_lines = Vec::new();
-    let mut line_start = 0;
+    let mut line_start = body_start;
 
     for (item, item_start) in flow.items.iter().zip(&flow.starts) {
         if let MeasureItem::Text { text, .. } = item {
             for (newline, _) in text.match_indices('\n') {
                 let newline = item_start + newline;
+                if newline < body_start {
+                    continue;
+                }
                 hard_lines.push(line_start..newline);
                 line_start = newline + 1;
             }
@@ -2038,7 +2174,7 @@ fn push_text_wrap_fragments<'a>(
     let font_size = text_style.font_size.to_pixels(window.rem_size());
     let mut cursor = range.start;
     for (highlight_range, highlight) in highlights {
-        if highlight.font_family.is_none() {
+        if highlight.font_family.is_none() && highlight.font_size_scale.is_none() {
             continue;
         }
         let start = highlight_range.start.max(cursor);
@@ -2561,6 +2697,7 @@ mod tests {
             font_family: Some(SharedString::from(MONO)),
             font_size_scale: None,
             code_style: None,
+            baseline_raise: None,
         };
         let items = vec![
             MeasureItem::Text {
@@ -2660,6 +2797,7 @@ mod tests {
             font_family: Some(SharedString::from(MONO)),
             font_size_scale: None,
             code_style: None,
+            baseline_raise: None,
         };
         let mut lines = |text: &'static str, span: &str| {
             let code = text.find(span).unwrap();
@@ -3023,6 +3161,7 @@ mod tests {
                     font_family: Some(MONO.into()),
                     font_size_scale: Some(0.875),
                     code_style: Some(code_style.clone()),
+                    baseline_raise: None,
                     style: HighlightStyle {
                         background_color: Some(gpui::green()),
                         ..Default::default()
@@ -3112,6 +3251,7 @@ mod tests {
                     InlineHighlight {
                         font_family: Some(MONO.into()),
                         font_size_scale: Some(0.875),
+                        code_style: Some(StyleRefinement::default()),
                         ..Default::default()
                     },
                 )],
@@ -3173,6 +3313,7 @@ mod tests {
                                     InlineHighlight {
                                         font_family: Some(MONO.into()),
                                         font_size_scale: Some(0.875),
+                                        code_style: Some(StyleRefinement::default()),
                                         ..Default::default()
                                     },
                                 )],
